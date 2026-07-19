@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, global_mean_pool
 from torch_geometric.utils import dense_to_sparse
 from torch_geometric.data import Data
-from torchmetrics.classification import BinaryAccuracy, BinaryF1Score, BinaryRecall
+from torchmetrics.classification import BinaryAccuracy, BinaryF1Score, BinaryRecall, BinaryPrecision
 from tqdm.auto import tqdm
 from torch_geometric.loader import DataLoader
 from sklearn.model_selection import StratifiedKFold, train_test_split, ParameterGrid
@@ -301,23 +301,19 @@ class FCGCN(torch.nn.Module):
         )
 
         train_acc_metric = BinaryAccuracy().to(device)
+        train_precision_metric = BinaryPrecision().to(device)
         train_recall_metric = BinaryRecall().to(device)
         train_f1_metric = BinaryF1Score().to(device)
 
         history = []
 
-        # Early stopping
         if early_stopping and val_loader is None:
             early_stopping = False
 
-        best_loss = math.inf
-        best_f1_loss_pair = (-math.inf, math.inf)
+        best_val_loss = math.inf
         best_epoch = None
         best_state_dict = None
-
-        epochs_without_f1_improvement = 0
-        epochs_with_bad_loss = 0
-        epochs_with_perfect_train_scores = 0
+        epochs_without_improvement = 0
 
 
         pbar = tqdm(range(epochs), desc="Training")
@@ -329,6 +325,7 @@ class FCGCN(torch.nn.Module):
             self.train()
     
             train_acc_metric.reset()
+            train_precision_metric.reset()
             train_recall_metric.reset()
             train_f1_metric.reset()
             
@@ -356,11 +353,13 @@ class FCGCN(torch.nn.Module):
                 preds = logits.argmax(dim=1)
 
                 train_acc_metric.update(preds, y)
+                train_precision_metric.update(preds, y)
                 train_recall_metric.update(preds, y)
                 train_f1_metric.update(preds, y)
             
             train_loss /= n_train
             train_acc = train_acc_metric.compute().item()
+            train_precision = train_precision_metric.compute().item()
             train_recall = train_recall_metric.compute().item()
             train_f1 = train_f1_metric.compute().item()
 
@@ -371,12 +370,13 @@ class FCGCN(torch.nn.Module):
                 "epoch": epoch_num,
                 "train_loss": train_loss,
                 "train_acc": train_acc,
+                "train_precision": train_precision,
                 "train_recall": train_recall,
                 "train_f1": train_f1,
             }
 
             if val_loader is not None:
-                val_loss, val_acc, val_recall, val_f1 = self._evaluate_loader(
+                val_loss, val_acc, val_precision, val_recall, val_f1 = self._evaluate_loader(
                     val_loader,
                     criterion=criterion,
                 )
@@ -385,6 +385,7 @@ class FCGCN(torch.nn.Module):
                     {
                         "val_loss": val_loss,
                         "val_acc": val_acc,
+                        "val_precision": val_precision,
                         "val_recall": val_recall,
                         "val_f1": val_f1,
                     }
@@ -403,93 +404,39 @@ class FCGCN(torch.nn.Module):
                 self._print_epoch_result(epoch_result)
 
             if early_stopping:
-                if "val_f1" not in epoch_result or "val_loss" not in epoch_result:
-                    raise ValueError(
-                        "Early stopping requires both 'val_f1' and 'val_loss' in epoch_result."
-                    )
-                loss_tolerance = 0.02
+                if "val_loss" not in epoch_result:
+                    raise ValueError("Early stopping requires 'val_loss' in epoch_result.")
 
-                current_f1 = epoch_result["val_f1"]
-                current_loss = epoch_result["val_loss"]
+                current_val_loss = epoch_result["val_loss"]
 
-                # Warm-up period:
-                # Do not select a best model and do not count patience before min_epochs.
-                if epoch_num < min_epochs + loss_patience:
-                    history.append(epoch_result)
-                    continue
+                # Do not select best model or count patience before min_epochs
+                if epoch_num >= min_epochs:
+                    improved = current_val_loss < best_val_loss - min_delta
 
-                # First valid epoch becomes the initial best.
-                if best_state_dict is None:
-                    best_f1_loss_pair = (current_f1, current_loss)
-                    best_loss = current_loss
-                    best_epoch = epoch_num
-                    best_state_dict = copy.deepcopy(self.state_dict())
+                    # First valid epoch after min_epochs
+                    if best_state_dict is None:
+                        improved = True
 
-                    epochs_without_f1_improvement = 0
-                    epochs_with_bad_loss = 0
+                    if improved:
+                        best_val_loss = current_val_loss
+                        best_epoch = epoch_num
+                        best_state_dict = copy.deepcopy(self.state_dict())
+                        epochs_without_improvement = 0
 
-                    best_path = os.path.join(str(self.model_dir), "model_best.pt")
-                    self.save(path=best_path, epoch=epoch_num)
+                        best_path = os.path.join(str(self.model_dir), "model_best.pt")
+                        self.save(path=best_path, epoch=epoch_num)
 
-                    history.append(epoch_result)
-                    continue
+                    else:
+                        epochs_without_improvement += 1
 
-                best_f1, best_pair_loss = best_f1_loss_pair
-
-                f1_improved = current_f1 > best_f1 + min_delta
-                f1_tied = abs(current_f1 - best_f1) <= min_delta
-                pair_improved = f1_improved or (
-                    f1_tied and current_loss < best_pair_loss - 1e-4
-                )
-
-                if pair_improved:
-                    best_f1_loss_pair = (current_f1, current_loss)
-                    best_epoch = epoch_num
-                    best_state_dict = copy.deepcopy(self.state_dict())
-                    epochs_without_f1_improvement = 0
-
-                    best_path = os.path.join(str(self.model_dir), "model_best.pt")
-                    self.save(path=best_path, epoch=epoch_num)
-                else:
-                    epochs_without_f1_improvement += 1
-
-                    # Loss overfitting guard:
-                    # only count it as bad if loss is clearly worse than the best saved loss.
-                if current_loss < best_loss - 1e-4:
-                    best_loss = current_loss
-                    epochs_with_bad_loss = 0
-                elif current_loss > best_loss + loss_tolerance:
-                    epochs_with_bad_loss += 1
-                    if current_loss > best_loss + 3*loss_tolerance:
-                        epochs_with_bad_loss += 1
-                
-                if epochs_without_f1_improvement >= patience:
-                    should_stop = True
-                    stop_reason = f"no val_f1 improvement for {patience} epochs"
-                elif epochs_with_bad_loss >= loss_patience:
-                    should_stop = True
-                    stop_reason = f"no val_loss improvevment for {loss_patience} epochs."
-
-                if (epoch_result["train_acc"] + epoch_result["train_recall"] + epoch_result["train_f1"] > 2.99):
-                    epochs_with_perfect_train_scores += 1
-                else:
-                    epochs_with_perfect_train_scores = 0
-                if (epochs_with_perfect_train_scores > 5
-                    and epochs_without_f1_improvement >= 10 and epochs_with_bad_loss >= 10):
-                    should_stop = True
-                    stop_reason = f"model perfectly fitted to training data, stopping for overfitting"
-
-                if should_stop:
-                    tqdm.write(
-                        f"Early stopping at epoch {epoch_num:03d}. "
-                        f"Best val_f1: {best_f1_loss_pair[0]:.4f}, "
-                        f"best val_loss: {best_loss:.4f}, "
-                        f"best epoch: {best_epoch:03d}. "
-                        f"Reason: {stop_reason}."
-                    )
-
-                    history.append(epoch_result)
-                    break
+                    if epochs_without_improvement >= patience:
+                        tqdm.write(
+                            f"Early stopping at epoch {epoch_num:03d}. "
+                            f"Best val_loss: {best_val_loss:.4f} "
+                            f"at epoch {best_epoch:03d}."
+                        )
+                        history.append(epoch_result)
+                        break
 
             history.append(epoch_result)
             #endregion
@@ -529,11 +476,12 @@ class FCGCN(torch.nn.Module):
         return preds    
 
     def evaluate(self, loader):
-        loss, acc, recall, f1 = self._evaluate_loader(loader)
+        loss, acc, precision, recall, f1 = self._evaluate_loader(loader)
 
         print(
             f"Loss: {loss:.4f} | "
             f"Accuracy: {acc:.4f} | "
+            f"Precision: {precision:.4f} | "
             f"Recall: {recall:.4f} | "
             f"F1: {f1:.4f}"
         )
@@ -541,6 +489,7 @@ class FCGCN(torch.nn.Module):
         return {
             "loss": loss,
             "acc": acc,
+            "precision": precision,
             "recall": recall,
             "f1": f1,
         }
@@ -727,7 +676,6 @@ class FCGCN(torch.nn.Module):
                 "dropout": self.dropout,
             }
         }
-        
         info_path = os.path.join(str(self._model_dir), "_info.json")
         with open(info_path, 'w') as f:
             json.dump(info, f, indent=4)
@@ -786,13 +734,13 @@ class FCGCN(torch.nn.Module):
 
     def _create_model_dir(self):
         model_dir = str(os.path.join(ARTIFACT_DIR, "models", "gcns", self._generate_model_name()))
+        os.makedirs(model_dir, exist_ok=True)
         return model_dir
 
     def _ensure_model_dir(self):
         if self._model_dir is None:
             self._model_dir = self._create_model_dir()
             self._save_model_info()
-        os.makedirs(self._model_dir, exist_ok=True)
 
         info_path = os.path.join(self._model_dir, "_info.json")
         if not os.path.exists(info_path):
@@ -807,6 +755,7 @@ class FCGCN(torch.nn.Module):
             criterion = torch.nn.CrossEntropyLoss()
 
         acc_metric = BinaryAccuracy().to(device)
+        precision_metric = BinaryPrecision().to(device)
         recall_metric = BinaryRecall().to(device)
         f1_metric = BinaryF1Score().to(device)
 
@@ -831,24 +780,28 @@ class FCGCN(torch.nn.Module):
                 preds = logits.argmax(dim=1)
 
                 acc_metric.update(preds, y)
+                precision_metric.update(preds, y)
                 recall_metric.update(preds, y)
                 f1_metric.update(preds, y)
 
         avg_loss = loss_total / n_samples
         acc = acc_metric.compute().item()
+        precision = precision_metric.compute().item()
         recall = recall_metric.compute().item()
         f1 = f1_metric.compute().item()
 
-        return avg_loss, acc, recall, f1
+        return avg_loss, acc, precision, recall, f1
 
     def _format_epoch_postfix(self, epoch_result):
         display_names = {
             "train_loss": "loss",
             "train_acc": "acc",
+            "train_precision": "precision",
             "train_recall": "recall",
             "train_f1": "f1",
             "val_loss": "val_loss",
             "val_acc": "val_acc",
+            "val_precision": "val_precision",
             "val_recall": "val_recall",
             "val_f1": "val_f1",
         }
@@ -863,10 +816,12 @@ class FCGCN(torch.nn.Module):
         keys = [
             "train_loss",
             "train_acc",
+            "train_precision",
             "train_recall",
             "train_f1",
             "val_loss",
             "val_acc",
+            "val_precision",
             "val_recall",
             "val_f1",
         ]
@@ -1313,6 +1268,6 @@ def crossval_gcn(
     with open(save_path, "w") as f:
         json.dump(report, f, indent=4)
 
-    
-
     return report
+
+
